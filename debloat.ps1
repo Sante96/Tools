@@ -20,7 +20,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$script:Version   = '1.0.6'
+$script:Version   = '1.0.7'
 # Cambia questo URL con il tuo raw GitHub: serve solo per la ri-esecuzione come admin.
 $script:ScriptUrl = 'https://raw.githubusercontent.com/Sante96/Tools/main/debloat.ps1'
 $script:LogFile   = Join-Path $env:TEMP ("debloat-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
@@ -450,10 +450,11 @@ function Initialize-SysInfo {
         $tot = Format-Size ([double]$ld.Size)
         $diskLabel = "$sysDrive $free liberi su $tot"
     }
+    # Il separatore resta testo semplice: il valore finisce in cache e non deve
+    # dipendere dai glifi, che valgono solo per la console corrente.
     if ($disk.Count -gt 0) {
         $n = $disk.Count
-        $w = if ($n -eq 1) { 'unita' } else { 'unita' }
-        if ($diskLabel) { $diskLabel += "  $(G 'Dot')  $n $w" } else { $diskLabel = "$n $w" }
+        if ($diskLabel) { $diskLabel += ", $n unita" } else { $diskLabel = "$n unita" }
     }
 
     # --- Scheda madre e BIOS.
@@ -1425,28 +1426,44 @@ function Show-MenuScreen {
     Write-Host ''
 
     # Scheda hardware: quante righe stanno dipende dall'altezza della console,
-    # perche' il menu sotto deve restare visibile per intero.
+    # perche' il menu sotto deve restare visibile per intero. Se lo spazio non
+    # basta il pannello sparisce del tutto: il menu conta piu' dell'hardware.
     $rows = @(Get-SysRows)
-    $fixed = 14 + $script:MenuItems.Count   # intestazione, cornice, voci, aiuti
-    $room = $script:Ui.Height - $fixed
+    # Righe sempre presenti: 4 di intestazione, la cornice, le voci con il
+    # sottotitolo di quella scelta, la riga vuota e quella dei comandi.
+    $compact = ($script:Ui.Height -lt 24)
+    $frameLines = if ($compact) { 1 } else { 4 }
+    # 4 intestazione + cornice + voci + sottotitolo della voce scelta + vuota +
+    # comandi + vuota finale.
+    $fixed = 4 + $frameLines + $script:MenuItems.Count + 1 + 3
+    # Il pannello porta con se' una riga vuota, quindi vale una riga in piu'.
+    $room = $script:Ui.Height - $fixed - 1
+    if ($room -lt 1) { $room = 0 }
     if ($room -lt $rows.Count) {
-        if ($room -lt 2) { $room = 2 }
         $rows = @($rows | Sort-Object { $_.P } | Select-Object -First $room |
                   Sort-Object { $script:SysOrder.IndexOf($_.L) })
     }
 
-    $labW = 0
-    foreach ($r in $rows) { if ($r.L.Length -gt $labW) { $labW = $r.L.Length } }
-    foreach ($r in $rows) {
-        $val = Get-Fit $r.V ($script:Ui.Width - $labW - 8)
-        Write-Host ('   ' + (Ansi -Text $r.L.PadRight($labW + 2) -Fg $script:Pal.Muted) +
-                    (Ansi -Text $val -Fg $script:Pal.Text))
+    if ($rows.Count -gt 0) {
+        $labW = 0
+        foreach ($r in $rows) { if ($r.L.Length -gt $labW) { $labW = $r.L.Length } }
+        foreach ($r in $rows) {
+            $val = Get-Fit $r.V ($script:Ui.Width - $labW - 8)
+            Write-Host ('   ' + (Ansi -Text $r.L.PadRight($labW + 2) -Fg $script:Pal.Muted) +
+                        (Ansi -Text $val -Fg $script:Pal.Text))
+        }
+        Write-Host ''
     }
-    Write-Host ''
 
+    # Sotto una certa altezza la cornice (3 righe) diventa un titolo secco (1 riga).
     $mode = if ($script:DryRun) { 'DRY-RUN' } else { 'LIVE' }
-    Write-Frame -Title 'Cosa vuoi fare' -Right $mode
-    Write-Host ''
+    if (-not $compact) {
+        Write-Frame -Title 'Cosa vuoi fare' -Right $mode
+        Write-Host ''
+    } else {
+        Write-Host ('  ' + (Ansi -Text 'Cosa vuoi fare' -Fg $script:Pal.Brand2 -Bold) +
+                    '  ' + (Ansi -Text $mode -Fg $script:Pal.Muted))
+    }
 
     for ($i = 0; $i -lt $script:MenuItems.Count; $i++) {
         $it = $script:MenuItems[$i]
