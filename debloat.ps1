@@ -20,7 +20,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$script:Version   = '1.0.4'
+$script:Version   = '1.0.5'
 # Cambia questo URL con il tuo raw GitHub: serve solo per la ri-esecuzione come admin.
 $script:ScriptUrl = 'https://raw.githubusercontent.com/Sante96/Tools/main/debloat.ps1'
 $script:LogFile   = Join-Path $env:TEMP ("debloat-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
@@ -132,19 +132,27 @@ function Get-Gradient {
     return $out
 }
 
-function Write-GradientLine {
-    param([string]$Text, [int[]]$From, [int[]]$To, [string]$Indent = '  ')
-    if (-not $script:Ui.Vt) { Write-Host ($Indent + $Text); return }
+function Get-GradientText {
+    # Restituisce la stringa colorata invece di scriverla: serve al loader, che
+    # deve ridisegnare la stessa riga molte volte.
+    param([string]$Text, [int[]]$From, [int[]]$To)
+    if (-not $script:Ui.Vt) { return $Text }
     $chars = $Text.ToCharArray()
+    if ($chars.Count -eq 0) { return '' }
     $g = @(Get-Gradient -From $From -To $To -Steps $chars.Count)
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append($Indent)
     for ($i = 0; $i -lt $chars.Count; $i++) {
         $c = $g[$i]
         [void]$sb.Append("$($script:E)[38;2;$($c[0]);$($c[1]);$($c[2])m$($chars[$i])")
     }
     [void]$sb.Append("$($script:E)[0m")
-    Write-Host $sb.ToString()
+    return $sb.ToString()
+}
+
+function Write-GradientLine {
+    param([string]$Text, [int[]]$From, [int[]]$To, [string]$Indent = '  ')
+    if (-not $script:Ui.Vt) { Write-Host ($Indent + $Text); return }
+    Write-Host ($Indent + (Get-GradientText -Text $Text -From $From -To $To))
 }
 
 function Clear-Screen {
@@ -184,11 +192,76 @@ function Show-WordMark {
     foreach ($r in $rows) {
         $line = $r.Replace('X', $block)
         Write-GradientLine -Text $line -From $script:Pal.Brand1 -To $script:Pal.Brand2
-        Start-Pause 55
+        Start-Pause 110
     }
     Write-Host ''
     $barW = [Math]::Min(42, $script:Ui.Width - 6)
     Write-GradientLine -Text ($shade * $barW) -From $script:Pal.Brand2 -To $script:Pal.Brand1
+    Start-Pause 200
+}
+
+function Show-Loader {
+    # Barra che si riempie con le fasi che avanzano. E' solo presentazione: il
+    # lavoro vero e' altrove, quindi la durata e' decisa qui.
+    param([string[]]$Steps, [int]$Ms = 2800)
+
+    $steps = @($Steps)
+    if ($steps.Count -eq 0) { return }
+
+    if (-not $script:Ui.Anim) {
+        foreach ($s in $steps) { Write-Host ('  ' + (Ansi -Text $s -Fg $script:Pal.Muted)) }
+        return
+    }
+
+    $block = G 'Block'
+    $shade = G 'Shade'
+    $barW = [Math]::Min(32, [Math]::Max(10, $script:Ui.Width - 26))
+
+    $spin = @('|', '/', '-', '\')
+    if ($script:Ui.Uni) {
+        $spin = @(0x280B, 0x2819, 0x2839, 0x2838, 0x283C, 0x2834, 0x2826, 0x2827, 0x2807, 0x280F) |
+                ForEach-Object { [string][char]$_ }
+    }
+
+    # Etichetta piu' lunga: serve per allineare la percentuale su tutte le fasi.
+    $labW = 0
+    foreach ($s in $steps) { if ($s.Length -gt $labW) { $labW = $s.Length } }
+    $labW = [Math]::Min($labW, [Math]::Max(8, $script:Ui.Width - $barW - 16))
+
+    $frameMs = 60
+    $total = [Math]::Max(1, [int]($Ms / $frameMs))
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+
+    for ($f = 0; $f -le $total; $f++) {
+        $t = $f / $total
+        $done = [int][Math]::Round($barW * $t)
+        $bar = ($block * $done) + ($shade * ($barW - $done))
+
+        $si = [Math]::Min($steps.Count - 1, [int]($t * $steps.Count))
+        $label = Get-Fit $steps[$si] $labW
+
+        $pct = ('{0,3}%' -f [int][Math]::Round($t * 100))
+        $sp = $spin[$f % $spin.Count]
+
+        $line = '  ' + (Ansi -Text $sp -Fg $script:Pal.Brand2) + '  ' +
+                (Get-GradientText -Text $bar -From $script:Pal.Brand1 -To $script:Pal.Brand2) + '  ' +
+                (Ansi -Text $pct -Fg $script:Pal.Text) + '  ' +
+                (Ansi -Text $label.PadRight($labW) -Fg $script:Pal.Muted)
+
+        Write-Host ("`r" + $line) -NoNewline
+
+        $target = ($f + 1) * $frameMs
+        $wait = $target - $sw.ElapsedMilliseconds
+        if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+    }
+    $sw.Stop()
+
+    # Riga finale: barra piena e spunta al posto dello spinner.
+    $line = '  ' + (Ansi -Text (G 'Check') -Fg $script:Pal.Ok) + '  ' +
+            (Get-GradientText -Text ($block * $barW) -From $script:Pal.Brand1 -To $script:Pal.Brand2) + '  ' +
+            (Ansi -Text '100%' -Fg $script:Pal.Text) + '  ' +
+            (Ansi -Text 'pronto'.PadRight($labW) -Fg $script:Pal.Ok)
+    Write-Host ("`r" + $line)
 }
 
 function Write-Typed {
@@ -247,10 +320,23 @@ function Show-Splash {
     Write-Host ''
     $name = Get-DisplayName
     Write-Typed -Text 'Bentornato, ' -Fg $script:Pal.Muted `
-                -Tail $name -TailFg $script:Pal.Brand2 -Ms 22
+                -Tail $name -TailFg $script:Pal.Brand2 -Ms 34
+    Start-Pause 260
     Write-Host ('  ' + (Ansi -Text "pulizia bloatware  $(G 'Dot')  v$($script:Version)" -Fg $script:Pal.Muted))
     Write-Host ''
-    Start-Pause 220
+    Start-Pause 420
+
+    # L'ultima fase non e' 'pronto': quella parola la dice la riga finale del
+    # loader, quando la barra e' davvero piena.
+    Show-Loader -Steps @(
+        'avvio'
+        'lettura configurazione'
+        'controllo ambiente'
+        'inventario applicazioni'
+        'ultimi controlli'
+    ) -Ms 3200
+    Write-Host ''
+    Start-Pause 400
 }
 
 function Write-Step {
@@ -270,11 +356,11 @@ function Show-InitSteps {
     Write-Host ''
 
     Write-Step 'Privilegi amministratore' 'ok'
-    Start-Pause 90
+    Start-Pause 220
 
     $psLabel = "PowerShell $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)"
     Write-Step 'Host' $psLabel
-    Start-Pause 90
+    Start-Pause 220
 
     # Il rilevamento hardware e' una query reale: la cache serve anche all'analisi.
     if ($null -eq $script:SysInfo) {
@@ -290,13 +376,13 @@ function Show-InitSteps {
         $state = 'ok'
     }
     Write-Step 'Sistema' $pc $state
-    Start-Pause 90
+    Start-Pause 220
 
     $osLabel = 'non rilevato'
     if ($script:SysInfo.Os) { $osLabel = "$($script:SysInfo.Os.Caption) build $($script:SysInfo.Os.BuildNumber)" }
     Write-Step 'Windows' $osLabel
     Write-Host ''
-    Start-Pause 260
+    Start-Pause 700
 }
 
 #endregion
