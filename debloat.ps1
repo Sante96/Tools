@@ -20,7 +20,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$script:Version   = '1.0.5'
+$script:Version   = '1.0.6'
 # Cambia questo URL con il tuo raw GitHub: serve solo per la ri-esecuzione come admin.
 $script:ScriptUrl = 'https://raw.githubusercontent.com/Sante96/Tools/main/debloat.ps1'
 $script:LogFile   = Join-Path $env:TEMP ("debloat-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
@@ -64,7 +64,7 @@ $script:Pal = @{
 }
 
 function Initialize-Ui {
-    $script:Ui = @{ Vt = $false; Uni = $false; Width = 80; Anim = $true; Keys = $true }
+    $script:Ui = @{ Vt = $false; Uni = $false; Width = 80; Height = 30; Anim = $true; Keys = $true }
 
     # ANSI: utile solo su console vera. Se l'output e' rediretto gli escape
     # finirebbero nel file, quindi in quel caso si scrive in chiaro.
@@ -80,8 +80,9 @@ function Initialize-Ui {
     } catch { }
 
     try {
-        $w = $Host.UI.RawUI.WindowSize.Width
-        if ($w -ge 40) { $script:Ui.Width = [int]$w }
+        $size = $Host.UI.RawUI.WindowSize
+        if ($size.Width -ge 40) { $script:Ui.Width = [int]$size.Width }
+        if ($size.Height -ge 10) { $script:Ui.Height = [int]$size.Height }
     } catch { }
 
     if ($redirected -or $env:DEBLOAT_NOANIM -eq '1') { $script:Ui.Anim = $false }
@@ -351,36 +352,188 @@ function Write-Step {
     Write-Host $line
 }
 
+function Format-Size {
+    # Byte in una forma leggibile: 68302901248 -> '64 GB'.
+    param([double]$Bytes, [int]$Decimals = 0)
+    if ($Bytes -le 0) { return '' }
+    $u = @('B', 'KB', 'MB', 'GB', 'TB', 'PB')
+    $i = 0
+    while ($Bytes -ge 1024 -and $i -lt ($u.Count - 1)) { $Bytes = $Bytes / 1024; $i++ }
+    $d = if ($i -le 2) { 0 } else { $Decimals }
+    return ('{0:N' + $d + '} {1}') -f $Bytes, $u[$i]
+}
+
+function Initialize-SysInfo {
+    # Raccoglie l'hardware una volta sola. Win32_Processor costa oltre un secondo,
+    # quindi la chiamata vive dentro il loader, dove l'attesa e' gia' mascherata.
+    if ($null -ne $script:SysInfo) { return }
+
+    # Con -Property si chiedono solo i campi che servono. Su Win32_Processor non e'
+    # un'ottimizzazione qualsiasi: la classe completa include LoadPercentage, che
+    # interroga i contatori di prestazioni e da sola costa oltre un secondo.
+    $q = {
+        param($Class, $Filter, $Props)
+        try {
+            $a = @{ ClassName = $Class; ErrorAction = 'SilentlyContinue' }
+            if ($Filter) { $a.Filter = $Filter }
+            if ($Props)  { $a.Property = $Props }
+            return @(Get-CimInstance @a)
+        } catch { return @() }
+    }
+
+    $cs   = @(& $q 'Win32_ComputerSystem')   | Select-Object -First 1
+    $os   = @(& $q 'Win32_OperatingSystem')  | Select-Object -First 1
+    $cpu  = @(& $q 'Win32_Processor' $null @('Name', 'NumberOfCores', 'NumberOfLogicalProcessors')) |
+            Select-Object -First 1
+    $bb   = @(& $q 'Win32_BaseBoard')        | Select-Object -First 1
+    $bios = @(& $q 'Win32_BIOS')             | Select-Object -First 1
+    $mem  = @(& $q 'Win32_PhysicalMemory')
+    $gpu  = @(& $q 'Win32_VideoController')
+    $disk = @(& $q 'Win32_DiskDrive')
+    $sysDrive = "$($env:SystemDrive)"
+    $ld   = @(& $q 'Win32_LogicalDisk' "DeviceID='$sysDrive'") | Select-Object -First 1
+
+    # --- CPU: nome compatto piu' core e thread.
+    $cpuLabel = ''
+    if ($cpu) {
+        $n = [string]$cpu.Name
+        $n = $n -replace '\(R\)|\(TM\)|\(tm\)', ''
+        $n = $n -replace '\s+CPU\s*', ' '
+        $n = $n -replace '\s+Processor\s*', ' '
+        $n = ($n -replace '\s+', ' ').Trim()
+        $cpuLabel = $n
+        if ($cpu.NumberOfCores) {
+            $t = $cpu.NumberOfLogicalProcessors
+            if (-not $t) { $t = $cpu.NumberOfCores }
+            $cpuLabel += "  $($cpu.NumberOfCores)C/$($t)T"
+        }
+    }
+
+    # --- RAM: totale dal sistema, velocita' e numero di moduli dai banchi.
+    $ramLabel = ''
+    $totalRam = 0
+    if ($cs -and $cs.TotalPhysicalMemory) { $totalRam = [double]$cs.TotalPhysicalMemory }
+    if ($totalRam -le 0 -and $mem.Count -gt 0) {
+        foreach ($m in $mem) { $totalRam += [double]$m.Capacity }
+    }
+    if ($totalRam -gt 0) {
+        # Il totale riportato da Windows e' poco sotto la taglia nominale: si arrotonda.
+        $gb = [int][Math]::Round($totalRam / 1GB)
+        $ramLabel = "$gb GB"
+        if ($mem.Count -gt 0) {
+            $sp = ($mem | ForEach-Object { [int]$_.ConfiguredClockSpeed } | Where-Object { $_ -gt 0 } |
+                   Sort-Object -Descending | Select-Object -First 1)
+            if (-not $sp) {
+                $sp = ($mem | ForEach-Object { [int]$_.Speed } | Where-Object { $_ -gt 0 } |
+                       Sort-Object -Descending | Select-Object -First 1)
+            }
+            if ($sp) { $ramLabel += "  $sp MT/s" }
+            $ramLabel += "  $($mem.Count) moduli"
+        }
+    }
+
+    # --- GPU: si scartano gli adattatori virtuali (monitor remoti, visori, capture).
+    $gpuNames = New-Object System.Collections.ArrayList
+    foreach ($g in $gpu) {
+        $gn = ([string]$g.Name).Trim()
+        if (-not $gn) { continue }
+        if ($gn -match 'virtual|remote|meta |parsec|idd |mirror|oray|spacedesk|citrix|vmware|basic display') { continue }
+        if ($gpuNames -notcontains $gn) { [void]$gpuNames.Add($gn) }
+    }
+    # AdapterRAM va in overflow sopra i 4 GB, quindi la VRAM non viene mostrata.
+    $gpuLabel = ($gpuNames -join ' + ')
+
+    # --- Disco di sistema piu' conteggio delle unita' fisiche.
+    $diskLabel = ''
+    if ($ld -and $ld.Size) {
+        $free = Format-Size ([double]$ld.FreeSpace)
+        $tot = Format-Size ([double]$ld.Size)
+        $diskLabel = "$sysDrive $free liberi su $tot"
+    }
+    if ($disk.Count -gt 0) {
+        $n = $disk.Count
+        $w = if ($n -eq 1) { 'unita' } else { 'unita' }
+        if ($diskLabel) { $diskLabel += "  $(G 'Dot')  $n $w" } else { $diskLabel = "$n $w" }
+    }
+
+    # --- Scheda madre e BIOS.
+    $boardLabel = ''
+    if ($bb) { $boardLabel = "$($bb.Manufacturer) $($bb.Product)".Trim() }
+    if (-not $boardLabel -and $cs) { $boardLabel = "$($cs.Manufacturer) $($cs.Model)".Trim() }
+    if ($bios -and $bios.SMBIOSBIOSVersion) { $boardLabel += "  BIOS $($bios.SMBIOSBIOSVersion)" }
+
+    # --- Modello del PC: sui preassemblati e' il dato che conta piu' della mainboard.
+    # Sugli assemblati invece Win32_ComputerSystem riporta la stessa stringa della
+    # scheda madre: in quel caso la riga 'Modello' sarebbe un doppione e si omette.
+    $modelLabel = ''
+    if ($cs) { $modelLabel = "$($cs.Manufacturer) $($cs.Model)".Trim() }
+    if ($modelLabel -and $bb) {
+        $bare = "$($bb.Manufacturer) $($bb.Product)".Trim()
+        if ($modelLabel -eq $bare) { $modelLabel = '' }
+    }
+
+    $osLabel = ''
+    if ($os) {
+        $osLabel = [string]$os.Caption
+        $osLabel = ($osLabel -replace 'Microsoft ', '').Trim()
+        $osLabel += " build $($os.BuildNumber)"
+    }
+
+    $script:SysInfo = @{
+        Cs = $cs; Os = $os
+        Model = $modelLabel; OsLabel = $osLabel; Board = $boardLabel
+        Cpu = $cpuLabel; Ram = $ramLabel; Gpu = $gpuLabel; Disk = $diskLabel
+    }
+}
+
+# Ordine di visualizzazione delle righe hardware: serve a rimetterle in fila dopo
+# che il filtro per priorita' ne ha scartate alcune.
+$script:SysOrder = @('Modello', 'Scheda madre', 'Processore', 'Memoria', 'Grafica', 'Archiviazione', 'Windows')
+
+function Get-SysRows {
+    # Righe dell'hardware in ordine di visualizzazione. 'P' e' la priorita': su
+    # console basse si tengono solo le prime, cosi' il menu non esce dallo schermo.
+    # Con -All tornano anche le voci non rilevate, che l'avvio segnala come warning.
+    param([switch]$All)
+
+    Initialize-SysInfo
+    $i = $script:SysInfo
+
+    # Attenzione al nome: in PowerShell le variabili non distinguono maiuscole,
+    # quindi una locale '$all' sovrascriverebbe il parametro '-All'.
+    # 'Opt' distingue il dato assente dal dato omesso di proposito: 'Modello' su un
+    # PC assemblato ripete la scheda madre, e in quel caso non e' un rilevamento
+    # mancato, quindi l'avvio non deve segnalarlo.
+    $list = @(
+        @{ L = 'Modello';       V = $i.Model;   P = 6; Opt = $true }
+        @{ L = 'Scheda madre';  V = $i.Board;   P = 7 }
+        @{ L = 'Processore';    V = $i.Cpu;     P = 1 }
+        @{ L = 'Memoria';       V = $i.Ram;     P = 2 }
+        @{ L = 'Grafica';       V = $i.Gpu;     P = 3 }
+        @{ L = 'Archiviazione'; V = $i.Disk;    P = 4 }
+        @{ L = 'Windows';       V = $i.OsLabel; P = 5 }
+    )
+    if ($All) { return $list }
+    return @($list | Where-Object { -not [string]::IsNullOrWhiteSpace($_.V) })
+}
+
 function Show-InitSteps {
-    Write-Host ('  ' + (Ansi -Text 'PREPARAZIONE' -Fg $script:Pal.Brand2 -Bold))
+    Write-Host ('  ' + (Ansi -Text 'SISTEMA' -Fg $script:Pal.Brand2 -Bold))
     Write-Host ''
 
-    Write-Step 'Privilegi amministratore' 'ok'
-    Start-Pause 220
+    $rows = @(Get-SysRows -All)
 
-    $psLabel = "PowerShell $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)"
-    Write-Step 'Host' $psLabel
-    Start-Pause 220
-
-    # Il rilevamento hardware e' una query reale: la cache serve anche all'analisi.
-    if ($null -eq $script:SysInfo) {
-        $cs = $null; $os = $null
-        try { $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue } catch { }
-        try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue } catch { }
-        $script:SysInfo = @{ Cs = $cs; Os = $os }
+    foreach ($r in $rows) {
+        if ([string]::IsNullOrWhiteSpace($r.V)) {
+            # Una riga opzionale vuota e' stata omessa di proposito, non e' un errore.
+            if ($r.Opt) { continue }
+            Write-Step $r.L 'non rilevato' 'warn'
+        } else {
+            Write-Step $r.L $r.V
+        }
+        Start-Pause 150
     }
-    $pc = 'non rilevato'
-    $state = 'warn'
-    if ($script:SysInfo.Cs) {
-        $pc = "$($script:SysInfo.Cs.Manufacturer) $($script:SysInfo.Cs.Model)".Trim()
-        $state = 'ok'
-    }
-    Write-Step 'Sistema' $pc $state
-    Start-Pause 220
 
-    $osLabel = 'non rilevato'
-    if ($script:SysInfo.Os) { $osLabel = "$($script:SysInfo.Os.Caption) build $($script:SysInfo.Os.BuildNumber)" }
-    Write-Step 'Windows' $osLabel
     Write-Host ''
     Start-Pause 700
 }
@@ -1264,17 +1417,30 @@ function Show-MenuScreen {
     # Saluto anche qui: il menu e' la schermata su cui si torna sempre, lo splash
     # lo si vede una volta sola.
     $name = Get-DisplayName
-    $sub = ''
-    if ($script:SysInfo -and $script:SysInfo.Cs) {
-        $sub = "$($script:SysInfo.Cs.Manufacturer) $($script:SysInfo.Cs.Model)".Trim()
-    }
     $box = Get-BoxWidth
     # Il nome va in colore brand: e' la parola che deve saltare all'occhio.
     $name = Get-Fit $name ($box - 12)
     Write-Host ('  ' + (Ansi -Text 'Bentornato, ' -Fg $script:Pal.Muted) +
                 (Ansi -Text $name -Fg $script:Pal.Brand2 -Bold))
-    if ($sub) {
-        Write-Host ('  ' + (Ansi -Text (Get-Fit $sub $box) -Fg $script:Pal.Muted))
+    Write-Host ''
+
+    # Scheda hardware: quante righe stanno dipende dall'altezza della console,
+    # perche' il menu sotto deve restare visibile per intero.
+    $rows = @(Get-SysRows)
+    $fixed = 14 + $script:MenuItems.Count   # intestazione, cornice, voci, aiuti
+    $room = $script:Ui.Height - $fixed
+    if ($room -lt $rows.Count) {
+        if ($room -lt 2) { $room = 2 }
+        $rows = @($rows | Sort-Object { $_.P } | Select-Object -First $room |
+                  Sort-Object { $script:SysOrder.IndexOf($_.L) })
+    }
+
+    $labW = 0
+    foreach ($r in $rows) { if ($r.L.Length -gt $labW) { $labW = $r.L.Length } }
+    foreach ($r in $rows) {
+        $val = Get-Fit $r.V ($script:Ui.Width - $labW - 8)
+        Write-Host ('   ' + (Ansi -Text $r.L.PadRight($labW + 2) -Fg $script:Pal.Muted) +
+                    (Ansi -Text $val -Fg $script:Pal.Text))
     }
     Write-Host ''
 
