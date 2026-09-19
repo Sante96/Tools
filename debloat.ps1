@@ -20,13 +20,14 @@
 
 $ErrorActionPreference = 'Stop'
 
-$script:Version   = '1.0.0'
+$script:Version   = '1.0.4'
 # Cambia questo URL con il tuo raw GitHub: serve solo per la ri-esecuzione come admin.
 $script:ScriptUrl = 'https://raw.githubusercontent.com/Sante96/Tools/main/debloat.ps1'
 $script:LogFile   = Join-Path $env:TEMP ("debloat-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
 $script:DryRun    = ($env:DEBLOAT_DRYRUN -eq '1')
 $script:Stats     = [ordered]@{ AppxRemoved = 0; ProvisionedRemoved = 0; Win32Removed = 0; TasksDisabled = 0; Failed = 0; Skipped = 0 }
 $script:SysInfo   = $null
+$script:UserName  = $null
 
 #region --------------------------------------------------------------------- tui
 
@@ -169,7 +170,7 @@ $script:WordMark = @(
     'X   X X     X   X X     X   X X   X    X  '
     'X   X XXXX  XXXX  X     X   X XXXXX    X  '
     'X   X X     X   X X     X   X X   X    X  '
-    'XXXX  XXXXX X   X XXXXX XXXXX X   X    X  '
+    'XXXX  XXXXX XXXX  XXXXX XXXXX X   X    X  '
 )
 
 function Show-WordMark {
@@ -191,14 +192,28 @@ function Show-WordMark {
 }
 
 function Write-Typed {
-    param([string]$Text, [int[]]$Fg, [string]$Indent = '  ', [int]$Ms = 18)
+    # Scrive a macchina, con la coda in un secondo colore (serve per il nome).
+    param(
+        [string]$Text,
+        [int[]]$Fg,
+        [string]$Tail = '',
+        [int[]]$TailFg,
+        [string]$Indent = '  ',
+        [int]$Ms = 18
+    )
+    if (-not $TailFg) { $TailFg = $Fg }
+
     if (-not $script:Ui.Anim) {
-        Write-Host ($Indent + (Ansi -Text $Text -Fg $Fg -Bold))
+        Write-Host ($Indent + (Ansi -Text $Text -Fg $Fg) + (Ansi -Text $Tail -Fg $TailFg -Bold))
         return
     }
     Write-Host $Indent -NoNewline
     foreach ($c in $Text.ToCharArray()) {
-        Write-Host (Ansi -Text ([string]$c) -Fg $Fg -Bold) -NoNewline
+        Write-Host (Ansi -Text ([string]$c) -Fg $Fg) -NoNewline
+        Start-Sleep -Milliseconds $Ms
+    }
+    foreach ($c in $Tail.ToCharArray()) {
+        Write-Host (Ansi -Text ([string]$c) -Fg $TailFg -Bold) -NoNewline
         Start-Sleep -Milliseconds $Ms
     }
     Write-Host ''
@@ -206,6 +221,10 @@ function Write-Typed {
 
 function Get-DisplayName {
     # Nome utente leggibile: prima il nome completo dell'account, poi il login.
+    # Il valore resta in cache: il menu si ridisegna a ogni tasto e la query CIM
+    # costa troppo per rifarla ogni volta.
+    if ($script:UserName) { return $script:UserName }
+
     $n = ''
     try {
         $full = (Get-CimInstance Win32_UserAccount -Filter "Name='$env:USERNAME'" -ErrorAction SilentlyContinue |
@@ -216,6 +235,7 @@ function Get-DisplayName {
     if ([string]::IsNullOrWhiteSpace($n)) { $n = 'utente' }
     $n = $n.Trim()
     if ($n -match '^(\S+)') { $n = $Matches[1] }
+    $script:UserName = $n
     return $n
 }
 
@@ -226,7 +246,8 @@ function Show-Splash {
     Show-WordMark
     Write-Host ''
     $name = Get-DisplayName
-    Write-Typed -Text "Bentornato, $name" -Fg $script:Pal.Text -Ms 22
+    Write-Typed -Text 'Bentornato, ' -Fg $script:Pal.Muted `
+                -Tail $name -TailFg $script:Pal.Brand2 -Ms 22
     Write-Host ('  ' + (Ansi -Text "pulizia bloatware  $(G 'Dot')  v$($script:Version)" -Fg $script:Pal.Muted))
     Write-Host ''
     Start-Pause 220
@@ -1153,6 +1174,22 @@ function Show-MenuScreen {
     Write-Host ''
     Write-GradientLine -Text ("DEBLOAT  " + (G 'Dot') + "  v$($script:Version)") `
                        -From $script:Pal.Brand1 -To $script:Pal.Brand2
+
+    # Saluto anche qui: il menu e' la schermata su cui si torna sempre, lo splash
+    # lo si vede una volta sola.
+    $name = Get-DisplayName
+    $sub = ''
+    if ($script:SysInfo -and $script:SysInfo.Cs) {
+        $sub = "$($script:SysInfo.Cs.Manufacturer) $($script:SysInfo.Cs.Model)".Trim()
+    }
+    $box = Get-BoxWidth
+    # Il nome va in colore brand: e' la parola che deve saltare all'occhio.
+    $name = Get-Fit $name ($box - 12)
+    Write-Host ('  ' + (Ansi -Text 'Bentornato, ' -Fg $script:Pal.Muted) +
+                (Ansi -Text $name -Fg $script:Pal.Brand2 -Bold))
+    if ($sub) {
+        Write-Host ('  ' + (Ansi -Text (Get-Fit $sub $box) -Fg $script:Pal.Muted))
+    }
     Write-Host ''
 
     $mode = if ($script:DryRun) { 'DRY-RUN' } else { 'LIVE' }
